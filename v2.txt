@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+Jarvis v4 — Dual-AI Modular Framework + Context Watcher + Edge-TTS (Ryan)
+- Two AI brains (AI1 drafts, AI2 advises)
+- Plug any API endpoint + model + key
+- Persistent memory (memory.json)
+- Background watcher (music/browser/process monitor)
+- Voice output using Edge-TTS (Ryan voice)
+"""
+
+import os
+import re
+import json
+import time
+import uuid
+import threading
+import tempfile
+import asyncio
+import requests
+import edge_tts
+import playsound
+import psutil
+import pygetwindow as gw
+from typing import List, Dict, Optional
+
+# ---------------- CONFIG ----------------
+# Users can plug their own API URL, key, and model here
+AI1_KEY = "YOUR_AI1_KEY_HERE"
+AI1_MODEL = "YOUR_AI1_MODEL_NAME"
+AI1_URL = "YOUR_AI1_API_URL"
+
+AI2_KEY = "YOUR_AI2_KEY_HERE"
+AI2_MODEL = "YOUR_AI2_MODEL_NAME"
+AI2_URL = "YOUR_AI2_API_URL"
+
+# Voice settings
+VOICE_NAME = "en-US-RyanMultilingualNeural"
+
+# memory
+MEMORY_FILE = "memory.json"
+MAX_HISTORY_TURNS = 1000
+KEEP_TURNS = MAX_HISTORY_TURNS * 2
+
+# audio
+AUDIO_DIR = os.path.join(os.path.expanduser("~"), "JarvisAudio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+# watcher settings
+WATCH_POLL_SECONDS = 2
+EVENT_COOLDOWN_SECONDS = 12
+
+MUSIC_PROCESS_NAMES = {"spotify", "vlc", "itunes", "wmplayer", "groove", "audacity", "music"}
+BROWSER_PROCESS_NAMES = {"chrome", "msedge", "firefox", "opera", "brave"}
+
+memory_lock = threading.Lock()
+
+# ---------------- UTILITIES ----------------
+def load_memory() -> List[Dict[str, str]]:
+    try:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    return []
+
+def save_memory(memory: List[Dict[str, str]]):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memory[-KEEP_TURNS:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[memory save error]", e)
+
+def add_to_memory(memory: List[Dict[str, str]], role: str, content: str):
+    with memory_lock:
+        memory.append({"role": role, "content": content})
+        if len(memory) > KEEP_TURNS:
+            del memory[:-KEEP_TURNS]
+        save_memory(memory)
+
+def clean_for_model(text: str) -> str:
+    cleaned = re.sub(r"[^\w\s\.\,\?\!\:\;\-\']", "", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+def clean_for_tts(text: str) -> str:
+    emoji_pattern = re.compile(
+        "["                                 
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "\U00002700-\U000027BF"
+        "\U0001F900-\U0001F9FF"
+        "\U00002600-\U000026FF"
+        "\U00002B00-\U00002BFF"
+        "]+", flags=re.UNICODE
+    )
+    no_emoji = emoji_pattern.sub("", text)
+    return re.sub(r"[^\x00-\x7F]+", "", no_emoji).strip()
+
+def safe_audio_path() -> str:
+    return os.path.join(AUDIO_DIR, f"jarvis_{int(time.time())}_{uuid.uuid4().hex}.mp3")
+
+# ---------------- Generic API call ----------------
+def call_ai(api_url: str, api_key: str, model: str, messages: List[Dict], max_tokens: int = 900, timeout: int = 40) -> Optional[str]:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    try:
+        r = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+        if r.status_code != 200:
+            print(f"[AI error {r.status_code} on {model}]: {r.text}")
+            return None
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"[network/API error] {e}")
+        return None
+
+# ---------------- Dual-AI logic ----------------
+def ai1_draft(user_clean: str, memory: List[Dict[str, str]]) -> Optional[str]:
+    system = (
+        "You are Jarvis — a smart, friendly assistant. "
+        "Give structured, clear answers. Don't reveal backend details."
+    )
+    msgs = [{"role": "system", "content": system}] + memory + [{"role": "user", "content": user_clean}]
+    return call_ai(AI1_URL, AI1_KEY, AI1_MODEL, msgs)
+
+def ai2_advice(draft: str) -> Optional[str]:
+    prompt = (
+        "Read the following AI draft and provide 2–3 short improvement suggestions "
+        "on tone, clarity, and factual accuracy. Keep your response concise."
+        f"\n\nDraft:\n{draft}"
+    )
+    msgs = [{"role": "system", "content": "You are a concise expert advisor."},
+            {"role": "user", "content": prompt}]
+    return call_ai(AI2_URL, AI2_KEY, AI2_MODEL, msgs)
+
+def ai1_refine(user_clean: str, draft: str, advice: str, memory: List[Dict[str, str]]) -> Optional[str]:
+    prompt = (
+        f"User: {user_clean}\n\nDraft: {draft}\n\nAdvisor suggestions: {advice}\n\n"
+        "Now create one final polished reply in a natural, friendly tone. Don't mention any internal steps."
+    )
+    msgs = [{"role": "system", "content": "You are Jarvis — the final voice."}] + memory + [{"role": "user", "content": prompt}]
+    return call_ai(AI1_URL, AI1_KEY, AI1_MODEL, msgs)
+
+# ---------------- TTS ----------------
+async def tts_save(text: str, voice: str = VOICE_NAME) -> Optional[str]:
+    cleaned = clean_for_tts(text)
+    if not cleaned:
+        return None
+    out_path = safe_audio_path()
+    try:
+        comm = edge_tts.Communicate(cleaned, voice)
+        await comm.save(out_path)
+        return out_path
+    except Exception as e:
+        print("[TTS save error]", e)
+        return None
+
+def play_audio(path: str):
+    try:
+        playsound.playsound(path)
+    except Exception:
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                os.system(f"xdg-open \"{path}\"")
+        except Exception:
+            pass
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+# ---------------- Context Watcher ----------------
+class ContextWatcher(threading.Thread):
+    def __init__(self, memory: List[Dict[str, str]]):
+        super().__init__(daemon=True)
+        self.memory = memory
+        self.last_active_title = ""
+        self.last_event_time = {}
+        self.running = True
+
+    def get_running_process_names(self) -> List[str]:
+        names = []
+        for p in psutil.process_iter(['name']):
+            try:
+                if p.info and p.info.get('name'):
+                    names.append(p.info['name'].lower())
+            except Exception:
+                continue
+        return names
+
+    def detect_music(self, proc_names: List[str]) -> Optional[str]:
+        for name in proc_names:
+            if any(m in name for m in MUSIC_PROCESS_NAMES):
+                return name
+        return None
+
+    def detect_browser(self, proc_names: List[str]) -> Optional[str]:
+        for name in proc_names:
+            if any(b in name for b in BROWSER_PROCESS_NAMES):
+                return name
+        return None
+
+    def maybe_emit(self, tag: str, payload: str):
+        now = time.time()
+        last = self.last_event_time.get(tag, 0)
+        if now - last < EVENT_COOLDOWN_SECONDS:
+            return
+        self.last_event_time[tag] = now
+        event_text = f"[system_event] {tag}: {payload}"
+        add_to_memory(self.memory, "system", event_text)
+        print(f"\n[Watcher] {payload}\n")
+
+    def run(self):
+        while self.running:
+            try:
+                active_title = ""
+                try:
+                    w = gw.getActiveWindow()
+                    if w and getattr(w, "title", None):
+                        active_title = w.title
+                except Exception:
+                    active_title = ""
+
+                if active_title and active_title != self.last_active_title:
+                    self.last_active_title = active_title
+                    self.maybe_emit("active_window", active_title)
+
+                proc_names = self.get_running_process_names()
+                music = self.detect_music(proc_names)
+                if music:
+                    self.maybe_emit("music_playing", music)
+
+                browser = self.detect_browser(proc_names)
+                if browser:
+                    self.maybe_emit("browser_running", browser)
+            except Exception:
+                pass
+            time.sleep(WATCH_POLL_SECONDS)
+
+    def stop(self):
+        self.running = False
+
+# ---------------- Core Loop ----------------
+def process_user_input(user_text: str, memory: List[Dict[str, str]]) -> str:
+    user_clean = clean_for_model(user_text)
+    add_to_memory(memory, "user", user_clean)
+
+    draft = ai1_draft(user_clean, memory)
+    if not draft:
+        return "Sorry, AI1 didn't respond."
+
+    advice = ai2_advice(draft) or "(No advisor feedback.)"
+    final = ai1_refine(user_clean, draft, advice, memory) or draft
+
+    add_to_memory(memory, "assistant", final)
+    return final
+
+# ---------------- MAIN ----------------
+def main():
+    print("=== Jarvis v4 — Dual-AI Modular + Context Watcher (Ryan voice) ===")
+    print("Commands: !clear, !help, exit\n")
+    memory = load_memory()
+
+    watcher = ContextWatcher(memory)
+    watcher.start()
+
+    try:
+        while True:
+            user = input("You: ").strip()
+            if not user:
+                continue
+            if user.lower() in {"exit", "quit"}:
+                print("Shutting down...")
+                break
+            if user == "!help":
+                print("Commands: !clear (clear memory), exit")
+                continue
+            if user == "!clear":
+                with memory_lock:
+                    memory.clear()
+                    save_memory(memory)
+                print("Memory cleared.")
+                continue
+
+            print("Jarvis: thinking...")
+            final = process_user_input(user, memory)
+            print(f"\nJarvis: {final}\n")
+
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                out = loop.run_until_complete(tts_save(final, VOICE_NAME))
+                loop.close()
+                if out:
+                    play_audio(out)
+            except Exception as e:
+                print("[TTS runtime error]", e)
+
+    finally:
+        watcher.stop()
+        watcher.join(timeout=1)
+
+if __name__ == "__main__":
+    main()
